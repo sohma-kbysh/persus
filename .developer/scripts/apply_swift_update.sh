@@ -140,23 +140,42 @@ if [[ "$TARGET_APP" != "$SOURCE_APP" ]]; then
   echo "  source: $SOURCE_APP"
   echo "  target: $TARGET_APP"
 
+  # The distributed source bundle is already signed during the release build.
+  # Verify that signature before touching the user's installed copy.
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$SOURCE_APP" \
+    || fail "配布された更新用アプリの署名を検証できませんでした。"
+
+  TEMP_APP="$TARGET_PARENT/.Perseus Local Reader.update.$$.app"
+  OLD_APP="$TARGET_PARENT/.Perseus Local Reader.old.$$.app"
+
+  /bin/rm -rf "$TEMP_APP" "$OLD_APP"
+
+  # Copy the complete, already-signed bundle. Do not merge bundle contents and
+  # do not re-sign on the user's Mac.
+  /usr/bin/ditto --noqtn "$SOURCE_APP" "$TEMP_APP" \
+    || fail "更新用アプリを一時配置できませんでした。"
+
+  /usr/bin/xattr -dr com.apple.quarantine "$TEMP_APP" 2>/dev/null || true
+
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$TEMP_APP" \
+    || fail "一時配置した更新用アプリの署名を検証できませんでした。"
+
   if [[ -d "$TARGET_APP" ]]; then
-    # Keep the outer bundle path stable so an existing Dock bookmark continues
-    # to refer to the updated application.
-    /usr/bin/rsync -aE --delete "$SOURCE_APP/" "$TARGET_APP/" \
-      || fail "Dockに登録されたアプリ本体の更新に失敗しました。"
-  else
-    /usr/bin/ditto "$SOURCE_APP" "$TARGET_APP" \
-      || fail "安定した場所へのアプリのコピーに失敗しました。"
+    /bin/mv "$TARGET_APP" "$OLD_APP" \
+      || fail "現在のアプリを更新準備用の場所へ移動できませんでした。"
   fi
 
-  # Copying over an existing app bundle can leave the previous ad-hoc
-  # signature stale. Re-sign the updated target bundle in place, then verify it.
-  /usr/bin/codesign --force --deep --sign - "$TARGET_APP" \
-    || fail "更新後のアプリを再署名できませんでした。"
+  if ! /bin/mv "$TEMP_APP" "$TARGET_APP"; then
+    if [[ -d "$OLD_APP" && ! -d "$TARGET_APP" ]]; then
+      /bin/mv "$OLD_APP" "$TARGET_APP" 2>/dev/null || true
+    fi
+    fail "更新後のアプリを所定の場所へ配置できませんでした。"
+  fi
+
+  /bin/rm -rf "$OLD_APP"
 
   /usr/bin/codesign --verify --deep --strict --verbose=2 "$TARGET_APP" \
-    || fail "更新後のアプリ署名を検証できませんでした。"
+    || fail "配置後のアプリ署名を検証できませんでした。"
 fi
 
 echo "Update completed. Reopening app:"

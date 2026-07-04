@@ -77,6 +77,11 @@ cat > "$APP_PATH/Contents/Info.plist" <<EOF
   ${ICON_PLIST}
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>
