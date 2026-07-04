@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Darwin
+import WebKit
 
 private let repositoryOwner = "sohma-kbysh"
 private let repositoryName = "perseus-local-reader"
@@ -8,8 +9,13 @@ private let updateBranch = "main"
 private let repositoryURLString =
     "https://github.com/\(repositoryOwner)/\(repositoryName)"
 private let defaultPort = 8000
+private let readerOpenTargetKey = "readerOpenTarget"
+private let embeddedReaderTarget = "embedded"
+private let defaultBrowserTarget = "default-browser"
+private let browserTargetPrefix = "browser:"
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
+    WKNavigationDelegate, WKUIDelegate {
     private var window: NSWindow!
     private var statusLabel: NSTextField!
     private var addressLabel: NSTextField!
@@ -19,6 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var serverLogHandle: FileHandle?
     private var readerRoot: URL?
     private var readerURL: URL?
+    private var webView: WKWebView?
+    private var readerWindow: NSWindow?
+    private var settingsWindow: NSWindow?
+    private var browserPopup: NSPopUpButton?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -44,6 +54,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stopServer()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard let closingWindow = notification.object as? NSWindow else {
+            return
+        }
+
+        if closingWindow === readerWindow {
+            NSApp.terminate(nil)
+            return
+        }
+
+        // 外部ブラウザ表示ではコントローラが唯一のメインウィンドウ。
+        if readerWindow == nil && closingWindow === window {
+            NSApp.terminate(nil)
+        }
+    }
+
     private func buildApplicationMenu() {
         let applicationName = "Perseus Local Reader"
 
@@ -63,8 +89,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         applicationMenu.addItem(.separator())
 
+        let settingsItem = NSMenuItem(
+            title: "設定…",
+            action: #selector(showSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        applicationMenu.addItem(settingsItem)
+
+        let controllerItem = NSMenuItem(
+            title: "コントローラを表示",
+            action: #selector(showControllerWindow),
+            keyEquivalent: ""
+        )
+        controllerItem.target = self
+        applicationMenu.addItem(controllerItem)
+
+        applicationMenu.addItem(.separator())
+
         let openReaderItem = NSMenuItem(
-            title: "ブラウザでReaderを開く",
+            title: "Readerを開く",
             action: #selector(openReader),
             keyEquivalent: "o"
         )
@@ -182,10 +226,524 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    private func currentReaderOpenTarget() -> String {
+        UserDefaults.standard.string(forKey: readerOpenTargetKey)
+            ?? embeddedReaderTarget
+    }
+
+    private func availableBrowserApplications() -> [
+        (name: String, bundleIdentifier: String, url: URL)
+    ] {
+        guard let probeURL = URL(string: "https://example.com/") else {
+            return []
+        }
+
+        let ownBundleIdentifier = Bundle.main.bundleIdentifier
+        var seen = Set<String>()
+        var applications: [(String, String, URL)] = []
+
+        for applicationURL in NSWorkspace.shared.urlsForApplications(
+            toOpen: probeURL
+        ) {
+            guard let bundle = Bundle(url: applicationURL),
+                  let bundleIdentifier = bundle.bundleIdentifier,
+                  bundleIdentifier != ownBundleIdentifier,
+                  seen.insert(bundleIdentifier).inserted
+            else {
+                continue
+            }
+
+            let displayName =
+                bundle.object(
+                    forInfoDictionaryKey: "CFBundleDisplayName"
+                ) as? String
+                ?? bundle.object(
+                    forInfoDictionaryKey: "CFBundleName"
+                ) as? String
+                ?? applicationURL.deletingPathExtension().lastPathComponent
+
+            applications.append(
+                (displayName, bundleIdentifier, applicationURL)
+            )
+        }
+
+        return applications.sorted {
+            $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending
+        }
+    }
+
+    @objc private func showControllerWindow() {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showSettings() {
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let settings = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 245),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        settings.title = "Perseus Local Reader 設定"
+        settings.center()
+        settings.isReleasedWhenClosed = false
+
+        let heading = NSTextField(labelWithString: "Readerを開く場所")
+        heading.font = .systemFont(ofSize: 17, weight: .semibold)
+
+        let explanation = NSTextField(
+            wrappingLabelWithString:
+                "標準ではアプリ内のReaderで開きます。"
+                + "既定のブラウザ、またはこのMacにインストールされている"
+                + "特定のブラウザ・URL対応アプリを選択できます。"
+        )
+        explanation.textColor = .secondaryLabelColor
+
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.addItem(withTitle: "アプリ内で開く（推奨）")
+        popup.lastItem?.representedObject = embeddedReaderTarget
+
+        popup.addItem(withTitle: "既定のブラウザで開く")
+        popup.lastItem?.representedObject = defaultBrowserTarget
+
+        let browserApplications = availableBrowserApplications()
+        if !browserApplications.isEmpty {
+            popup.menu?.addItem(.separator())
+        }
+
+        for application in browserApplications {
+            popup.addItem(withTitle: application.name)
+            popup.lastItem?.representedObject =
+                browserTargetPrefix + application.bundleIdentifier
+        }
+
+        let currentTarget = currentReaderOpenTarget()
+        if let matchingItem = popup.itemArray.first(where: {
+            ($0.representedObject as? String) == currentTarget
+        }) {
+            popup.select(matchingItem)
+        } else {
+            popup.selectItem(at: 0)
+            UserDefaults.standard.set(
+                embeddedReaderTarget,
+                forKey: readerOpenTargetKey
+            )
+        }
+
+        popup.target = self
+        popup.action = #selector(readerOpenTargetChanged(_:))
+        browserPopup = popup
+
+        let note = NSTextField(
+            wrappingLabelWithString:
+                "設定は次回起動時と「Readerを開く」に反映されます。"
+                + "外部ブラウザを選んだ場合、そのブラウザのタブは"
+                + "Perseus Local Reader終了時に自動では閉じません。"
+        )
+        note.textColor = .secondaryLabelColor
+        note.font = .systemFont(ofSize: 12)
+
+        let closeButton = NSButton(
+            title: "閉じる",
+            target: settings,
+            action: #selector(NSWindow.close)
+        )
+
+        let buttonRow = NSStackView(views: [NSView(), closeButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.distribution = .fill
+
+        let stack = NSStackView(views: [
+            heading,
+            explanation,
+            popup,
+            note,
+            buttonRow,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(stack)
+        settings.contentView = content
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(
+                equalTo: content.leadingAnchor,
+                constant: 22
+            ),
+            stack.trailingAnchor.constraint(
+                equalTo: content.trailingAnchor,
+                constant: -22
+            ),
+            stack.topAnchor.constraint(
+                equalTo: content.topAnchor,
+                constant: 22
+            ),
+            stack.bottomAnchor.constraint(
+                lessThanOrEqualTo: content.bottomAnchor,
+                constant: -22
+            ),
+            popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
+
+        settingsWindow = settings
+        settings.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func readerOpenTargetChanged(_ sender: NSPopUpButton) {
+        guard let target = sender.selectedItem?.representedObject as? String
+        else {
+            return
+        }
+
+        UserDefaults.standard.set(target, forKey: readerOpenTargetKey)
+    }
+
+    private func openReaderUsingPreference(_ url: URL) {
+        let target = currentReaderOpenTarget()
+
+        if target == embeddedReaderTarget {
+            showEmbeddedReader(url)
+        } else {
+            openExternally(url, target: target)
+        }
+    }
+
+    private func openExternally(_ url: URL, target: String) {
+        guard target.hasPrefix(browserTargetPrefix) else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        let bundleIdentifier = String(
+            target.dropFirst(browserTargetPrefix.count)
+        )
+
+        guard let applicationURL =
+                NSWorkspace.shared.urlForApplication(
+                    withBundleIdentifier: bundleIdentifier
+                )
+        else {
+            UserDefaults.standard.set(
+                defaultBrowserTarget,
+                forKey: readerOpenTargetKey
+            )
+
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "選択したブラウザが見つかりません"
+            alert.informativeText =
+                "既定のブラウザで開きます。設定も既定のブラウザへ変更しました。"
+            alert.runModal()
+
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+
+        NSWorkspace.shared.open(
+            [url],
+            withApplicationAt: applicationURL,
+            configuration: configuration
+        ) { _, error in
+            guard let error else { return }
+
+            DispatchQueue.main.async {
+                let alert = NSAlert(error: error)
+                alert.messageText = "選択したブラウザで開けませんでした"
+                alert.runModal()
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
+    private func showEmbeddedReader(_ url: URL) {
+        if let webView {
+            webView.load(URLRequest(url: url))
+            window.orderOut(nil)
+            readerWindow?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+
+        let readerWebView = WKWebView(
+            frame: .zero,
+            configuration: configuration
+        )
+        readerWebView.navigationDelegate = self
+        readerWebView.uiDelegate = self
+        readerWebView.allowsMagnification = true
+        readerWebView.translatesAutoresizingMaskIntoConstraints = false
+
+        let backButton = NSButton(
+            title: "←",
+            target: self,
+            action: #selector(goBackInReader)
+        )
+        backButton.toolTip = "戻る"
+
+        let forwardButton = NSButton(
+            title: "→",
+            target: self,
+            action: #selector(goForwardInReader)
+        )
+        forwardButton.toolTip = "進む"
+
+        let reloadButton = NSButton(
+            title: "再読み込み",
+            target: self,
+            action: #selector(reloadEmbeddedReader)
+        )
+
+        let homeButton = NSButton(
+            title: "ライブラリ",
+            target: self,
+            action: #selector(openReaderHome)
+        )
+
+        let settingsButton = NSButton(
+            title: "設定",
+            target: self,
+            action: #selector(showSettings)
+        )
+
+        let externalButton = NSButton(
+            title: "外部ブラウザで開く",
+            target: self,
+            action: #selector(openCurrentPageExternally)
+        )
+
+        let toolbar = NSStackView(views: [
+            backButton,
+            forwardButton,
+            reloadButton,
+            homeButton,
+            NSView(),
+            settingsButton,
+            externalButton,
+        ])
+        toolbar.orientation = .horizontal
+        toolbar.alignment = .centerY
+        toolbar.spacing = 8
+        toolbar.edgeInsets = NSEdgeInsets(
+            top: 7,
+            left: 10,
+            bottom: 7,
+            right: 10
+        )
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(toolbar)
+        container.addSubview(readerWebView)
+
+        NSLayoutConstraint.activate([
+            toolbar.leadingAnchor.constraint(
+                equalTo: container.leadingAnchor
+            ),
+            toolbar.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor
+            ),
+            toolbar.topAnchor.constraint(
+                equalTo: container.topAnchor
+            ),
+            toolbar.heightAnchor.constraint(greaterThanOrEqualToConstant: 42),
+
+            readerWebView.leadingAnchor.constraint(
+                equalTo: container.leadingAnchor
+            ),
+            readerWebView.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor
+            ),
+            readerWebView.topAnchor.constraint(
+                equalTo: toolbar.bottomAnchor
+            ),
+            readerWebView.bottomAnchor.constraint(
+                equalTo: container.bottomAnchor
+            ),
+        ])
+
+        let reader = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1240, height: 820),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        reader.title = "Perseus Local Reader"
+        reader.minSize = NSSize(width: 780, height: 560)
+        reader.delegate = self
+        reader.contentView = container
+        reader.center()
+
+        webView = readerWebView
+        readerWindow = reader
+
+        // 起動時の小さいコントローラは隠すが、メニューから再表示できる。
+        window.orderOut(nil)
+        reader.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        readerWebView.load(URLRequest(url: url))
+    }
+
+    @objc private func goBackInReader() {
+        webView?.goBack()
+    }
+
+    @objc private func goForwardInReader() {
+        webView?.goForward()
+    }
+
+    @objc private func reloadEmbeddedReader() {
+        webView?.reload()
+    }
+
+    @objc private func openReaderHome() {
+        guard let readerURL else { return }
+        webView?.load(URLRequest(url: readerURL))
+    }
+
+    @objc private func openCurrentPageExternally() {
+        guard let url = webView?.url ?? readerURL else { return }
+
+        let target = currentReaderOpenTarget()
+        let externalTarget =
+            target == embeddedReaderTarget
+            ? defaultBrowserTarget
+            : target
+
+        openExternally(url, target: externalTarget)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Perseus Local Reader"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        completionHandler()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "確認"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "キャンセル")
+
+        let response = alert.runModal()
+        completionHandler(response == .alertFirstButtonReturn)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (String?) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "入力"
+        alert.informativeText = prompt
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "キャンセル")
+
+        let input = NSTextField(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 24)
+        )
+        input.stringValue = defaultText ?? ""
+        alert.accessoryView = input
+
+        let response = alert.runModal()
+        completionHandler(
+            response == .alertFirstButtonReturn
+                ? input.stringValue
+                : nil
+        )
+    }
+
+    private func isLocalReaderURL(_ url: URL) -> Bool {
+        guard url.scheme == "http" || url.scheme == "https" else {
+            return url.scheme == "about"
+        }
+
+        return url.host == "127.0.0.1" || url.host == "localhost"
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler:
+            @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+
+        if isLocalReaderURL(url) {
+            decisionHandler(.allow)
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+        decisionHandler(.cancel)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        guard navigationAction.targetFrame == nil,
+              let url = navigationAction.request.url
+        else {
+            return nil
+        }
+
+        if isLocalReaderURL(url) {
+            webView.load(navigationAction.request)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+
+        return nil
+    }
+
     private func buildWindow() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 440, height: 230),
-            styleMask: [.titled, .closable, .miniaturizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -205,7 +763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         addressLabel.textColor = .secondaryLabelColor
 
         openButton = NSButton(
-            title: "ブラウザで開く",
+            title: "Readerを開く",
             target: self,
             action: #selector(openReader)
         )
@@ -388,7 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             self.statusLabel.textColor = .systemGreen
                             self.addressLabel.stringValue = url.absoluteString
                             self.openButton.isEnabled = true
-                            NSWorkspace.shared.open(url)
+                            self.openReaderUsingPreference(url)
                             self.checkForUpdates(manual: false)
                         }
                         return
@@ -430,7 +988,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func openReader() {
         guard let url = readerURL else { return }
-        NSWorkspace.shared.open(url)
+        openReaderUsingPreference(url)
     }
 
     @objc private func quitApplication() {
@@ -473,6 +1031,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         self.statusLabel.stringValue =
                             "更新を確認できませんでした。オフラインでも読書は続けられます。"
                         self.statusLabel.textColor = .secondaryLabelColor
+
+                        let alert = NSAlert()
+                        alert.alertStyle = .warning
+                        alert.messageText = "更新を確認できませんでした"
+                        alert.informativeText =
+                            "オフラインでも、保存済みの内容はそのまま読めます。"
+                        alert.runModal()
                     }
                     return
                 }
@@ -486,6 +1051,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if manual {
                         self.statusLabel.stringValue = "最新版です（\(local)）"
                         self.statusLabel.textColor = .systemGreen
+
+                        let alert = NSAlert()
+                        alert.alertStyle = .informational
+                        alert.messageText = "最新版です"
+                        alert.informativeText = "Version \(local) を使用しています。"
+                        alert.runModal()
                     }
                     return
                 }

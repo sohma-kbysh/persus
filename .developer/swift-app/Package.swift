@@ -15,7 +15,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "PerseusLocalReader",
-            path: "Sources/PerseusLocalReader"
+            path: "Sources/PerseusLocalReader",
+            linkerSettings: [
+                .linkedFramework("WebKit")
+            ]
         )
     ],
     swiftLanguageVersions: [.v5]
