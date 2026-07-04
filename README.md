@@ -1,14 +1,16 @@
 # Perseus Local Reader
 
-Perseus Local Reader is a macOS application for reading classical Greek texts and their translations locally. It uses openly distributed data from the Perseus Digital Library and provides a searchable library, downloadable works, translation switching, in-work search, and on-demand morphological analysis.
+Perseus Local Reader は、Perseus Digital Library が公開しているデータを利用し、古典ギリシア語の原文と翻訳をMac上で読むための読書環境です。著者名や作品名からテキストを検索し、読みたい作品を手元に保存して閲覧できます。
 
-The repository now uses a **single Swift controller application**:
+ギリシア語原文と翻訳の切り替え、作品内検索、節や行による移動、単語をクリックして形態情報を確認する機能を備えています。一度取得した作品や形態解析データはローカルに保存されるため、保存済みの内容はオフラインでも利用できます。
+
+利用者が開くアプリは、次の1つだけです。
 
 ```text
 Perseus Local Reader.app
 ```
 
-The previous separate `Open`, `Close`, and `Update` applications are no longer required. The Swift application starts and supervises the local Python server, opens the reader in the default browser, checks for updates, and shuts the server down when the application exits.
+このアプリを開くと読書環境が起動し、自動的にブラウザで本文画面が開きます。読書を終えるときは、アプリの「終了」ボタンを押すか、アプリのウィンドウを閉じてください。起動中の読書環境も同時に終了します。
 
 ---
 
@@ -308,15 +310,7 @@ git status
 
 ## 1. Overview
 
-Perseus Local Reader is a local macOS reading environment for classical Greek texts and their translations. It uses openly distributed Perseus data and combines:
-
-- an AppKit-based Swift controller application;
-- a Python HTTP server bound exclusively to the loopback interface;
-- a browser-based library and reading interface;
-- on-demand TEI download and conversion;
-- persistent local work storage;
-- persistent Perseus Hopper morphology caching;
-- automatic version checking and self-update support.
+Perseus Local Reader is a macOS application for reading classical Greek texts and their translations locally. It uses openly distributed data from the Perseus Digital Library and provides a searchable library, downloadable works, translation switching, citation-aware navigation, in-work search, and on-demand morphological analysis.
 
 The public user-facing entry point is a single application:
 
@@ -324,7 +318,9 @@ The public user-facing entry point is a single application:
 Perseus Local Reader.app
 ```
 
-The former separate Open, Close, and Update applets are obsolete after this migration.
+The previous separate Open, Close, and Update applications are no longer required. The Swift application starts and supervises the local Python server, opens the reader in the default browser, checks GitHub for updates, and shuts the server down when the application exits.
+
+The application preserves downloaded works and cached morphology data across normal launches and supported updates. Already downloaded content remains available for offline reading.
 
 ## 2. System requirements
 
